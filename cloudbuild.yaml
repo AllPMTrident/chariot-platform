@@ -1,0 +1,28 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/chariot-api:latest'
+      - '-f'
+      - 'chariot-backend/Dockerfile'
+      - 'chariot-backend/'
+
+  # Push the image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/chariot-api:latest'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gke-deploy'
+    args:
+      - run
+      - '--filename=.'
+      - '--image=gcr.io/$PROJECT_ID/chariot-api:latest'
+      - '--location=us-east1'
+      - '--output=/workspace/deploy'
+
+images:
+  - 'gcr.io/$PROJECT_ID/chariot-api:latest'
