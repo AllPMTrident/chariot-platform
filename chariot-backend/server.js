@@ -1,11 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+
+// Load environment variables FIRST
+dotenv.config();
+
 const { v4: uuidv4 } = require('uuid');
 const pool = require('./database');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
-dotenv.config();
+const { router: authRouter, authenticateToken, requireRole } = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -98,6 +101,12 @@ const buildFilterWhere = (filters) => {
   
   return { where, params, nextParamIndex: paramIndex };
 };
+
+// ============================================
+// AUTH ROUTES
+// ============================================
+
+app.use('/api/auth', authRouter);
 
 // ============================================
 // HEALTH CHECK
@@ -676,30 +685,211 @@ app.get('/api/orders', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/orders', asyncHandler(async (req, res) => {
-  const { company_id, location_id, customer_id, vehicle_id, appointment_id, note, priority } = req.body;
-  
+  const {
+    company_id,
+    location_id,
+    customer_id,
+    vehicle_id,
+    appointment_id,
+    service_writer_id,
+    note,
+    priority,
+    status,
+    appointment_date,
+    due_date,
+    payment_terms,
+    customer_po,
+    campaign,
+    workflow_status
+  } = req.body;
+
   if (!customer_id || !location_id) {
     return res.status(400).json({ error: 'customer_id and location_id are required' });
   }
-  
+
   const result = await pool.query(
-    'INSERT INTO "order" (company_id, location_id, customer_id, vehicle_id, appointment_id, note, priority, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-    [company_id || uuidv4(), location_id, customer_id, vehicle_id, appointment_id, note || '', priority || 'normal', 'open']
+    `INSERT INTO "order" (
+      company_id, location_id, customer_id, vehicle_id, appointment_id,
+      service_writer_id, note, priority, status, appointment_date, due_date,
+      payment_terms, customer_po, campaign, workflow_status
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
+    [
+      company_id || uuidv4(),
+      location_id,
+      customer_id,
+      vehicle_id,
+      appointment_id,
+      service_writer_id,
+      note || '',
+      priority || 'normal',
+      status || 'open',
+      appointment_date,
+      due_date,
+      payment_terms,
+      customer_po,
+      campaign,
+      workflow_status
+    ]
   );
-  
+
   res.status(201).json(result.rows[0]);
 }));
 
 app.get('/api/orders/:id', asyncHandler(async (req, res) => {
   const order = await pool.query('SELECT * FROM "order" WHERE id = $1 AND deleted = false', [req.params.id]);
-  
+
   if (order.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-  
+
   const lineItems = await pool.query('SELECT * FROM order_line_item WHERE order_id = $1 ORDER BY ordinal', [req.params.id]);
-  
+
   res.json({
     ...order.rows[0],
     line_items: lineItems.rows
+  });
+}));
+
+// GET comprehensive order details with all related data
+app.get('/api/orders/:id/details', asyncHandler(async (req, res) => {
+  const orderId = req.params.id;
+
+  // Get order with service writer info
+  const orderResult = await pool.query(`
+    SELECT o.*,
+           sw.id as sw_id, sw.first_name as sw_first_name, sw.last_name as sw_last_name, sw.email as sw_email,
+           l.name as location_name, l.address1, l.city, l.state, l.phone as location_phone
+    FROM "order" o
+    LEFT JOIN "user" sw ON o.service_writer_id = sw.id
+    LEFT JOIN location l ON o.location_id = l.id
+    WHERE o.id = $1 AND o.deleted = false
+  `, [orderId]);
+
+  if (orderResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  const order = orderResult.rows[0];
+
+  // Get customer with emails and phones
+  const customerResult = await pool.query(`
+    SELECT c.*
+    FROM customer c
+    WHERE c.id = $1
+  `, [order.customer_id]);
+
+  const customer = customerResult.rows[0] || null;
+
+  if (customer) {
+    const emails = await pool.query('SELECT * FROM email WHERE customer_id = $1 ORDER BY "primary" DESC', [customer.id]);
+    const phones = await pool.query('SELECT * FROM phone_number WHERE customer_id = $1 ORDER BY "primary" DESC', [customer.id]);
+    customer.emails = emails.rows;
+    customer.phones = phones.rows;
+  }
+
+  // Get vehicle
+  const vehicleResult = await pool.query('SELECT * FROM vehicle WHERE id = $1', [order.vehicle_id]);
+  const vehicle = vehicleResult.rows[0] || null;
+
+  // Get assigned technicians
+  const techniciansResult = await pool.query(`
+    SELECT DISTINCT u.id, u.first_name, u.last_name, u.email, u.phone, u.role
+    FROM "user" u
+    JOIN timesheet t ON u.id = t.technician_id
+    WHERE t.order_id = $1
+  `, [orderId]);
+  const technicians = techniciansResult.rows;
+
+  // Get order line items (services)
+  const lineItemsResult = await pool.query(`
+    SELECT * FROM order_line_item
+    WHERE order_id = $1
+    ORDER BY ordinal, created_at
+  `, [orderId]);
+  const lineItems = lineItemsResult.rows;
+
+  // Get inspections with items
+  const inspectionsResult = await pool.query(`
+    SELECT i.*,
+           u.first_name as completed_by_first_name,
+           u.last_name as completed_by_last_name
+    FROM inspection i
+    LEFT JOIN "user" u ON i.completed_by_id = u.id
+    WHERE i.order_id = $1
+    ORDER BY i.created_at DESC
+  `, [orderId]);
+
+  const inspections = inspectionsResult.rows;
+
+  // Get inspection items for each inspection
+  for (let inspection of inspections) {
+    const itemsResult = await pool.query(`
+      SELECT * FROM inspection_item
+      WHERE inspection_id = $1
+      ORDER BY ordinal, created_at
+    `, [inspection.id]);
+    inspection.items = itemsResult.rows;
+  }
+
+  // Get timesheets (time clocks)
+  const timesheetsResult = await pool.query(`
+    SELECT t.*,
+           u.first_name as technician_first_name,
+           u.last_name as technician_last_name,
+           s.name as service_name
+    FROM timesheet t
+    LEFT JOIN "user" u ON t.technician_id = u.id
+    LEFT JOIN service s ON t.service_id = s.id
+    WHERE t.order_id = $1
+    ORDER BY t.clock_in DESC
+  `, [orderId]);
+  const timesheets = timesheetsResult.rows;
+
+  // Get transactions/payments
+  const transactionsResult = await pool.query(`
+    SELECT * FROM "transaction"
+    WHERE order_id = $1
+    ORDER BY created_at DESC
+  `, [orderId]);
+  const transactions = transactionsResult.rows;
+
+  // Get messages (internal notes)
+  const messagesResult = await pool.query(`
+    SELECT m.*,
+           u.first_name as author_first_name,
+           u.last_name as author_last_name
+    FROM message m
+    LEFT JOIN "user" u ON m.author_id = u.id
+    WHERE m.order_id = $1
+    ORDER BY m.created_at DESC
+  `, [orderId]);
+  const messages = messagesResult.rows;
+
+  // Get appointment if linked
+  let appointment = null;
+  if (order.appointment_id) {
+    const appointmentResult = await pool.query('SELECT * FROM appointment WHERE id = $1', [order.appointment_id]);
+    appointment = appointmentResult.rows[0] || null;
+  }
+
+  // Return comprehensive order details
+  res.json({
+    order: {
+      ...order,
+      service_writer: order.sw_id ? {
+        id: order.sw_id,
+        first_name: order.sw_first_name,
+        last_name: order.sw_last_name,
+        email: order.sw_email
+      } : null
+    },
+    customer,
+    vehicle,
+    technicians,
+    line_items: lineItems,
+    inspections,
+    timesheets,
+    transactions,
+    messages,
+    appointment
   });
 }));
 
